@@ -1,0 +1,14 @@
+# テキストファイルをGitで正規化する
+* text=auto
+
+# ソースコードはLFに統一する
+*.py text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Windows用スクリプトはCRLFにする
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
