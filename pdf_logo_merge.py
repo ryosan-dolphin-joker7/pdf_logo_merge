@@ -12,8 +12,16 @@ Windows用EXE（PyInstaller --onefile --windowed）での利用を想定して�
     - 貼り付け座標を画面で入力
     - 全ページまたは「1,3-5」のような指定ページへ合成
     - 切り取り範囲のプレビュー
+    - PDF全体を表示し、マウスドラッグで切り取り範囲と配置範囲を指定
     - 入力・座標・ページ範囲・暗号化PDF・保存先を事前検証
     - 一時保存後に出力を置き換え、保存失敗による既存PDF破損を防止
+
+セキュリティ方針:
+    - PDF拡張子だけでなくファイルヘッダーと実際の文書形式も確認する
+    - 過大なファイル、ページ数、プレビュー画像による資源枯渇を防止する
+    - 入力PDFの上書き、ハードリンク経由の同一ファイル指定を防止する
+    - shell / subprocess / 外部通信は使用しない
+    - 出力はランダム名の一時PDFへ保存し、成功時だけアトミックに置換する
 
 座標系:
     PyMuPDFの座標（単位: point、原点: ページ左上）を使用する。
@@ -40,9 +48,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
+# 公式パッケージ名で読み込み、同名に近い別パッケージとの取り違えを防ぐ。
 # PyMuPDFが未導入でも、GUIで分かりやすいエラーを表示できるようにする。
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
 except ImportError as exc:  # pragma: no cover - PyMuPDF未導入時だけ通る
     fitz = None  # type: ignore[assignment]
     FITZ_IMPORT_ERROR: ImportError | None = exc
@@ -70,6 +79,16 @@ DEFAULT_DESTINATION_COORDS: Final[tuple[float, float, float, float]] = (
     60.0,
 )
 
+# 不正・破損PDFや誤操作によるメモリ／ディスクの過剰消費を抑える上限。
+# 通常の帳票用途には十分余裕を持たせている。必要なら運用に合わせて変更できる。
+MAX_INPUT_FILE_BYTES: Final[int] = 1 * 1024 * 1024 * 1024  # 1 GiB
+MAX_PDF_PAGES: Final[int] = 20_000
+MAX_PAGE_SPECIFICATION_LENGTH: Final[int] = 10_000
+MAX_PAGE_DIMENSION_POINTS: Final[float] = 200_000.0
+MAX_PREVIEW_PIXELS: Final[int] = 8_000_000
+PREVIEW_MAX_WIDTH: Final[int] = 1_000
+PREVIEW_MAX_HEIGHT: Final[int] = 650
+
 ProgressCallback = Callable[[str], None]
 
 
@@ -92,15 +111,53 @@ def ensure_distinct_paths(*paths: Path) -> None:
             "抽出元PDF、合成先PDF、出力PDFには異なるファイルを指定してください。"
         )
 
+    # 表記上のパスが違っても、ハードリンク等で実体が同じ場合を検出する。
+    existing_paths = [path for path in paths if path.exists()]
+    for index, left_path in enumerate(existing_paths):
+        for right_path in existing_paths[index + 1 :]:
+            try:
+                if os.path.samefile(left_path, right_path):
+                    raise PdfMergeError(
+                        "抽出元PDF、合成先PDF、出力PDFには"
+                        "実体の異なるファイルを指定してください。"
+                    )
+            except OSError:
+                # 権限や一時的なファイル状態は、後続のopen/saveで詳細に扱う。
+                continue
+
 
 def validate_input_file(path: Path, label: str) -> None:
-    """入力ファイルの存在・種類・拡張子を確認する。"""
+    """入力ファイルの存在・サイズ・拡張子・PDFヘッダーを確認する。"""
     if not path.exists():
         raise PdfMergeError(f"{label}が見つかりません。\n{path}")
     if not path.is_file():
         raise PdfMergeError(f"{label}はファイルではありません。\n{path}")
     if path.suffix.lower() != ".pdf":
         raise PdfMergeError(f"{label}にはPDFファイルを指定してください。\n{path}")
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise PdfMergeError(f"{label}の情報を取得できません。\n{path}") from exc
+    if file_size <= 0:
+        raise PdfMergeError(f"{label}は空のファイルです。\n{path}")
+    if file_size > MAX_INPUT_FILE_BYTES:
+        raise PdfMergeError(
+            f"{label}が安全上の上限（{MAX_INPUT_FILE_BYTES // (1024 ** 2):,} MB）"
+            f"を超えています。\n{path}"
+        )
+
+    # PDF仕様ではヘッダーは先頭1,024バイト以内に置くことが推奨される。
+    try:
+        with path.open("rb") as input_file:
+            header = input_file.read(1024)
+    except OSError as exc:
+        raise PdfMergeError(f"{label}を読み取れません。\n{path}") from exc
+    if b"%PDF-" not in header:
+        raise PdfMergeError(
+            f"{label}はPDFヘッダーを確認できません。"
+            "拡張子だけを .pdf に変更したファイルは使用できません。\n"
+            f"{path}"
+        )
 
 
 def validate_output_path(path: Path) -> None:
@@ -109,14 +166,39 @@ def validate_output_path(path: Path) -> None:
         raise PdfMergeError("出力ファイルの拡張子は .pdf にしてください。")
     if not path.parent.exists() or not path.parent.is_dir():
         raise PdfMergeError(f"出力先フォルダーが存在しません。\n{path.parent}")
+    if path.exists() and not path.is_file():
+        raise PdfMergeError(f"出力先は通常のファイルではありません。\n{path}")
 
 
 def validate_pdf_document(document: "fitz.Document", label: str) -> None:
-    """PDFがページを持ち、パスワードなしで処理できることを確認する。"""
+    """文書形式・暗号化状態・ページ数を確認する。"""
+    if not document.is_pdf:
+        raise PdfMergeError(f"{label}の実体はPDF形式ではありません。")
     if document.needs_pass:
         raise PdfMergeError(f"{label}はパスワードで保護されています。")
     if document.page_count < 1:
         raise PdfMergeError(f"{label}にページがありません。")
+    if document.page_count > MAX_PDF_PAGES:
+        raise PdfMergeError(
+            f"{label}のページ数が安全上の上限（{MAX_PDF_PAGES:,}ページ）"
+            f"を超えています。\nページ数: {document.page_count:,}"
+        )
+
+
+def get_unrotated_page_rect(page: "fitz.Page") -> "fitz.Rect":
+    """挿入・clipで使用する、回転前の可視ページ領域を返す。"""
+    rect = fitz.Rect(page.rect) * page.derotation_matrix
+    if (
+        rect.is_empty
+        or rect.is_infinite
+        or rect.width > MAX_PAGE_DIMENSION_POINTS
+        or rect.height > MAX_PAGE_DIMENSION_POINTS
+    ):
+        raise PdfMergeError(
+            "PDFページの寸法が不正、または安全上の上限を超えています。\n"
+            f"ページサイズ: {tuple(rect)}"
+        )
+    return rect
 
 
 def validate_rectangle(
@@ -151,6 +233,9 @@ def validate_rectangle(
 
 def parse_target_pages(page_specification: str, page_count: int) -> list[int]:
     """「すべて」「1,3-5」をPyMuPDF用の0始まりページ番号へ変換する。"""
+    if len(page_specification) > MAX_PAGE_SPECIFICATION_LENGTH:
+        raise PdfMergeError("対象ページの指定が長すぎます。")
+
     normalized = (
         page_specification.strip()
         .lower()
@@ -221,6 +306,7 @@ def merge_pdf_area(
     temporary_output = output_path.with_name(
         f".{output_path.stem}_{uuid.uuid4().hex}.tmp.pdf"
     )
+    expected_target_page_count: int | None = None
 
     def notify(message: str) -> None:
         # PyInstallerの--windowedでは標準出力がNoneになるため、存在時だけ表示する。
@@ -235,6 +321,7 @@ def merge_pdf_area(
         ) as target_document:
             validate_pdf_document(source_document, "抽出元PDF")
             validate_pdf_document(target_document, "合成先PDF")
+            expected_target_page_count = target_document.page_count
 
             if source_page_number > source_document.page_count:
                 raise PdfMergeError(
@@ -246,7 +333,7 @@ def merge_pdf_area(
             source_page = source_document.load_page(source_page_index)
             validate_rectangle(
                 source_clip,
-                source_page.rect,
+                get_unrotated_page_rect(source_page),
                 "切り取り範囲",
                 source_page_number,
             )
@@ -260,7 +347,7 @@ def merge_pdf_area(
                 target_page = target_document.load_page(page_index)
                 validate_rectangle(
                     destination_rect,
-                    target_page.rect,
+                    get_unrotated_page_rect(target_page),
                     "貼り付け範囲",
                     page_index + 1,
                 )
@@ -296,6 +383,12 @@ def merge_pdf_area(
 
         if not temporary_output.exists() or temporary_output.stat().st_size == 0:
             raise PdfMergeError("出力PDFの一時保存に失敗しました。")
+
+        # 保存直後に再オープンし、破損やページ欠落がないことを確認してから置換する。
+        with fitz.open(str(temporary_output)) as verification_document:
+            validate_pdf_document(verification_document, "出力PDF")
+            if verification_document.page_count != expected_target_page_count:
+                raise PdfMergeError("出力PDFのページ数が合成先PDFと一致しません。")
         os.replace(temporary_output, output_path)
         return len(page_indices)
     finally:
@@ -327,7 +420,12 @@ def create_clip_preview_png(
             )
         page = document.load_page(source_page_number - 1)
         clip = fitz.Rect(source_clip_coords)
-        validate_rectangle(clip, page.rect, "切り取り範囲", source_page_number)
+        validate_rectangle(
+            clip,
+            get_unrotated_page_rect(page),
+            "切り取り範囲",
+            source_page_number,
+        )
 
         base_scale = 3.0
         max_width = 900.0
@@ -338,10 +436,17 @@ def create_clip_preview_png(
             max_height / max(clip.height, 1.0),
         )
         scale = max(scale, 0.2)
+        scale = min(
+            scale,
+            math.sqrt(
+                MAX_PREVIEW_PIXELS / max(clip.width * clip.height, 1.0)
+            ),
+        )
         pixmap = page.get_pixmap(
             matrix=fitz.Matrix(scale, scale),
             clip=clip,
             alpha=False,
+            annots=False,
         )
         description = (
             f"ページ {source_page_number}/{document.page_count}  "
@@ -351,14 +456,457 @@ def create_clip_preview_png(
         return pixmap.tobytes("png"), description
 
 
+def render_page_preview_png(
+    path: Path,
+    page_number: int,
+) -> tuple[bytes, int, int, "fitz.Rect", "fitz.Matrix", "fitz.Matrix", int, int]:
+    """範囲選択画面用にページ全体を安全な大きさでPNG化する。
+
+    戻り値には、画面座標とPDF座標を相互変換するためのページ矩形と
+    回転／回転解除行列も含める。PDF自体は変更しない。
+    """
+    if fitz is None:
+        raise PdfMergeError("PyMuPDFがインストールされていません。")
+    validate_input_file(path, "PDF")
+    if page_number < 1:
+        raise PdfMergeError("ページ番号には1以上の整数を指定してください。")
+
+    with fitz.open(str(path)) as document:
+        validate_pdf_document(document, "PDF")
+        if page_number > document.page_count:
+            raise PdfMergeError(
+                f"PDFは{document.page_count}ページです。\n指定ページ: {page_number}"
+            )
+        page = document.load_page(page_number - 1)
+        display_rect = fitz.Rect(page.rect)
+        get_unrotated_page_rect(page)  # ページ寸法の安全性を確認する。
+
+        scale = min(
+            PREVIEW_MAX_WIDTH / max(display_rect.width, 1.0),
+            PREVIEW_MAX_HEIGHT / max(display_rect.height, 1.0),
+            2.0,
+        )
+        scale = max(scale, 0.01)
+        estimated_pixels = display_rect.width * display_rect.height * scale * scale
+        if estimated_pixels > MAX_PREVIEW_PIXELS:
+            scale *= math.sqrt(MAX_PREVIEW_PIXELS / estimated_pixels)
+
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(scale, scale),
+            alpha=False,
+            annots=False,
+        )
+        if pixmap.width * pixmap.height > MAX_PREVIEW_PIXELS:
+            raise PdfMergeError("プレビュー画像が安全上の画素数上限を超えています。")
+
+        return (
+            pixmap.tobytes("png"),
+            pixmap.width,
+            pixmap.height,
+            display_rect,
+            fitz.Matrix(page.rotation_matrix),
+            fitz.Matrix(page.derotation_matrix),
+            document.page_count,
+            page.rotation,
+        )
+
+
+class PdfRegionSelector:
+    """PDFページを表示し、マウスドラッグで矩形座標を選択する画面。"""
+
+    def __init__(
+        self,
+        parent: tk.Tk,
+        pdf_path: Path,
+        initial_page_number: int,
+        initial_coordinates: tuple[float, float, float, float],
+        title: str,
+        instruction: str,
+        outline_color: str,
+    ) -> None:
+        self.parent = parent
+        self.pdf_path = pdf_path
+        self.initial_page_number = initial_page_number
+        self.initial_coordinates = initial_coordinates
+        self.outline_color = outline_color
+        self.result: tuple[tuple[float, float, float, float], int] | None = None
+
+        self.page_number = initial_page_number
+        self.page_count = 0
+        self.page_rotation = 0
+        self.image_width = 0
+        self.image_height = 0
+        self.display_page_rect: "fitz.Rect | None" = None
+        self.rotation_matrix: "fitz.Matrix | None" = None
+        self.derotation_matrix: "fitz.Matrix | None" = None
+        self.selected_pdf_rect: "fitz.Rect | None" = None
+        self.drag_start: tuple[float, float] | None = None
+        self.selection_item: int | None = None
+        self.photo: tk.PhotoImage | None = None
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(title)
+        self.window.transient(parent)
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        window_width = min(1_080, max(760, screen_width - 100))
+        window_height = min(820, max(600, screen_height - 120))
+        self.window.geometry(f"{window_width}x{window_height}")
+        self.window.minsize(720, 560)
+        self.window.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.window.bind("<Escape>", lambda _event: self._cancel())
+
+        outer = ttk.Frame(self.window, padding=12)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            outer,
+            text=instruction,
+            wraplength=1_000,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        toolbar = ttk.Frame(outer)
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(toolbar, text="◀ 前ページ", command=self._previous_page).pack(
+            side="left"
+        )
+        ttk.Label(toolbar, text="ページ").pack(side="left", padx=(12, 4))
+        self.page_var = tk.StringVar(value=str(initial_page_number))
+        page_entry = ttk.Entry(toolbar, textvariable=self.page_var, width=7)
+        page_entry.pack(side="left")
+        page_entry.bind("<Return>", lambda _event: self._go_to_entered_page())
+        ttk.Button(toolbar, text="表示", command=self._go_to_entered_page).pack(
+            side="left", padx=(4, 0)
+        )
+        ttk.Button(toolbar, text="次ページ ▶", command=self._next_page).pack(
+            side="left", padx=(8, 0)
+        )
+        self.page_info_var = tk.StringVar(value="")
+        ttk.Label(toolbar, textvariable=self.page_info_var).pack(
+            side="left", padx=(14, 0)
+        )
+        ttk.Button(toolbar, text="選択解除", command=self._clear_selection).pack(
+            side="right"
+        )
+
+        canvas_frame = ttk.Frame(outer)
+        canvas_frame.grid(row=2, column=0, sticky="nsew")
+        canvas_frame.columnconfigure(0, weight=1)
+        canvas_frame.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(
+            canvas_frame,
+            background="#404040",
+            cursor="crosshair",
+            highlightthickness=0,
+        )
+        horizontal_scrollbar = ttk.Scrollbar(
+            canvas_frame, orient="horizontal", command=self.canvas.xview
+        )
+        vertical_scrollbar = ttk.Scrollbar(
+            canvas_frame, orient="vertical", command=self.canvas.yview
+        )
+        self.canvas.configure(
+            xscrollcommand=horizontal_scrollbar.set,
+            yscrollcommand=vertical_scrollbar.set,
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+        self.canvas.bind("<ButtonPress-1>", self._start_selection)
+        self.canvas.bind("<B1-Motion>", self._update_selection)
+        self.canvas.bind("<ButtonRelease-1>", self._finish_selection)
+
+        bottom = ttk.Frame(outer)
+        bottom.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self.selection_info_var = tk.StringVar(
+            value="PDF上で左上から右下へドラッグしてください。"
+        )
+        ttk.Label(
+            bottom,
+            textvariable=self.selection_info_var,
+            wraplength=760,
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(bottom, text="キャンセル", command=self._cancel).pack(
+            side="right", padx=(8, 0)
+        )
+        self.accept_button = ttk.Button(
+            bottom,
+            text="この範囲を使用",
+            command=self._accept,
+            state="disabled",
+        )
+        self.accept_button.pack(side="right")
+
+        try:
+            self._render_page(use_initial_selection=True)
+        except Exception:
+            self.window.destroy()
+            raise
+
+        self.window.grab_set()
+        self.window.focus_set()
+
+    def show(self) -> tuple[tuple[float, float, float, float], int] | None:
+        """選択画面をモーダル表示し、確定された座標とページ番号を返す。"""
+        self.parent.wait_window(self.window)
+        return self.result
+
+    def _render_page(self, use_initial_selection: bool = False) -> None:
+        (
+            png_bytes,
+            self.image_width,
+            self.image_height,
+            self.display_page_rect,
+            self.rotation_matrix,
+            self.derotation_matrix,
+            self.page_count,
+            self.page_rotation,
+        ) = render_page_preview_png(self.pdf_path, self.page_number)
+
+        image_data = base64.b64encode(png_bytes).decode("ascii")
+        self.photo = tk.PhotoImage(data=image_data, format="png")
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self.photo, anchor="nw", tags="page")
+        self.canvas.configure(
+            scrollregion=(0, 0, self.image_width, self.image_height)
+        )
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+        self.page_var.set(str(self.page_number))
+        self.page_info_var.set(
+            f"/ {self.page_count}　表示回転: {self.page_rotation}°"
+        )
+        self.drag_start = None
+        self.selection_item = None
+        self.selected_pdf_rect = None
+        self.accept_button.configure(state="disabled")
+        self.selection_info_var.set(
+            "PDF上で左上から右下へドラッグしてください。"
+        )
+
+        if use_initial_selection:
+            initial_rect = fitz.Rect(self.initial_coordinates)
+            try:
+                unrotated_page_rect = (
+                    fitz.Rect(self.display_page_rect) * self.derotation_matrix
+                )
+                validate_rectangle(
+                    initial_rect,
+                    unrotated_page_rect,
+                    "現在の座標",
+                    self.page_number,
+                )
+            except PdfMergeError:
+                return
+            self.selected_pdf_rect = initial_rect
+            self._draw_pdf_selection(initial_rect)
+            self._update_selection_information(initial_rect)
+            self.accept_button.configure(state="normal")
+
+    def _event_canvas_point(self, event: tk.Event) -> tuple[float, float]:
+        """イベント座標を画像内へ収めたCanvas座標に変換する。"""
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        return (
+            min(max(x, 0.0), float(self.image_width)),
+            min(max(y, 0.0), float(self.image_height)),
+        )
+
+    def _start_selection(self, event: tk.Event) -> None:
+        if self.photo is None:
+            return
+        self.drag_start = self._event_canvas_point(event)
+        if self.selection_item is not None:
+            self.canvas.delete(self.selection_item)
+        x, y = self.drag_start
+        self.selection_item = self.canvas.create_rectangle(
+            x,
+            y,
+            x,
+            y,
+            outline=self.outline_color,
+            width=3,
+            dash=(7, 3),
+            tags="selection",
+        )
+        self.selected_pdf_rect = None
+        self.accept_button.configure(state="disabled")
+
+    def _update_selection(self, event: tk.Event) -> None:
+        if self.drag_start is None or self.selection_item is None:
+            return
+        current_x, current_y = self._event_canvas_point(event)
+        start_x, start_y = self.drag_start
+        self.canvas.coords(
+            self.selection_item,
+            min(start_x, current_x),
+            min(start_y, current_y),
+            max(start_x, current_x),
+            max(start_y, current_y),
+        )
+
+    def _finish_selection(self, event: tk.Event) -> None:
+        if self.drag_start is None:
+            return
+        end_x, end_y = self._event_canvas_point(event)
+        start_x, start_y = self.drag_start
+        self.drag_start = None
+        if abs(end_x - start_x) < 3 or abs(end_y - start_y) < 3:
+            self._clear_selection()
+            self.selection_info_var.set(
+                "選択範囲が小さすぎます。範囲をドラッグして指定してください。"
+            )
+            return
+
+        selected_rect = self._canvas_rect_to_pdf_rect(
+            min(start_x, end_x),
+            min(start_y, end_y),
+            max(start_x, end_x),
+            max(start_y, end_y),
+        )
+        self.selected_pdf_rect = selected_rect
+        self._draw_pdf_selection(selected_rect)
+        self._update_selection_information(selected_rect)
+        self.accept_button.configure(state="normal")
+
+    def _canvas_rect_to_pdf_rect(
+        self, x0: float, y0: float, x1: float, y1: float
+    ) -> "fitz.Rect":
+        """表示中のCanvas矩形を、回転前のPDF座標へ変換する。"""
+        if self.display_page_rect is None or self.derotation_matrix is None:
+            raise PdfMergeError("プレビューの座標情報を取得できません。")
+        scale_x = self.display_page_rect.width / self.image_width
+        scale_y = self.display_page_rect.height / self.image_height
+        displayed_pdf_rect = fitz.Rect(
+            self.display_page_rect.x0 + x0 * scale_x,
+            self.display_page_rect.y0 + y0 * scale_y,
+            self.display_page_rect.x0 + x1 * scale_x,
+            self.display_page_rect.y0 + y1 * scale_y,
+        )
+        unrotated_rect = displayed_pdf_rect * self.derotation_matrix
+        return fitz.Rect(
+            min(unrotated_rect.x0, unrotated_rect.x1),
+            min(unrotated_rect.y0, unrotated_rect.y1),
+            max(unrotated_rect.x0, unrotated_rect.x1),
+            max(unrotated_rect.y0, unrotated_rect.y1),
+        )
+
+    def _draw_pdf_selection(self, rect: "fitz.Rect") -> None:
+        """回転前のPDF矩形を画面座標へ変換して選択枠を描画する。"""
+        if self.display_page_rect is None or self.rotation_matrix is None:
+            return
+        displayed_rect = fitz.Rect(rect) * self.rotation_matrix
+        scale_x = self.image_width / self.display_page_rect.width
+        scale_y = self.image_height / self.display_page_rect.height
+        canvas_rect = (
+            (displayed_rect.x0 - self.display_page_rect.x0) * scale_x,
+            (displayed_rect.y0 - self.display_page_rect.y0) * scale_y,
+            (displayed_rect.x1 - self.display_page_rect.x0) * scale_x,
+            (displayed_rect.y1 - self.display_page_rect.y0) * scale_y,
+        )
+        if self.selection_item is None:
+            self.selection_item = self.canvas.create_rectangle(
+                *canvas_rect,
+                outline=self.outline_color,
+                width=3,
+                dash=(7, 3),
+                tags="selection",
+            )
+        else:
+            self.canvas.coords(self.selection_item, *canvas_rect)
+
+    def _update_selection_information(self, rect: "fitz.Rect") -> None:
+        self.selection_info_var.set(
+            "選択座標: "
+            f"({rect.x0:.2f}, {rect.y0:.2f}) - "
+            f"({rect.x1:.2f}, {rect.y1:.2f}) pt"
+        )
+
+    def _clear_selection(self) -> None:
+        if self.selection_item is not None:
+            self.canvas.delete(self.selection_item)
+        self.selection_item = None
+        self.selected_pdf_rect = None
+        self.drag_start = None
+        self.accept_button.configure(state="disabled")
+        self.selection_info_var.set(
+            "PDF上で左上から右下へドラッグしてください。"
+        )
+
+    def _parse_entered_page(self) -> int:
+        try:
+            page_number = int(self.page_var.get().strip())
+        except ValueError as exc:
+            raise PdfMergeError("ページ番号には整数を入力してください。") from exc
+        if not 1 <= page_number <= self.page_count:
+            raise PdfMergeError(
+                f"ページ番号は1から{self.page_count}の範囲で指定してください。"
+            )
+        return page_number
+
+    def _go_to_entered_page(self) -> None:
+        try:
+            self._change_page(self._parse_entered_page())
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, str(exc), parent=self.window)
+
+    def _previous_page(self) -> None:
+        if self.page_number <= 1:
+            return
+        self._change_page(self.page_number - 1)
+
+    def _next_page(self) -> None:
+        if self.page_number >= self.page_count:
+            return
+        self._change_page(self.page_number + 1)
+
+    def _change_page(self, new_page_number: int) -> None:
+        """表示失敗時に元ページへ戻せるよう、安全にページを切り替える。"""
+        previous_page_number = self.page_number
+        self.page_number = new_page_number
+        try:
+            self._render_page()
+        except Exception as exc:
+            self.page_number = previous_page_number
+            self.page_var.set(str(previous_page_number))
+            messagebox.showerror(
+                APP_TITLE,
+                f"ページを表示できませんでした。\n{type(exc).__name__}: {exc}",
+                parent=self.window,
+            )
+
+    def _accept(self) -> None:
+        if self.selected_pdf_rect is None:
+            messagebox.showwarning(
+                APP_TITLE,
+                "PDF上で範囲を選択してください。",
+                parent=self.window,
+            )
+            return
+        rect = self.selected_pdf_rect
+        self.result = (
+            (rect.x0, rect.y0, rect.x1, rect.y1),
+            self.page_number,
+        )
+        self.window.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+
 class PdfMergeApp:
     """PDF合成条件の入力、プレビュー、実行を提供するTkinter GUI。"""
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("820x660")
-        self.root.minsize(760, 620)
+        self.root.geometry("900x720")
+        self.root.minsize(800, 660)
 
         application_directory = get_application_directory()
         default_source = application_directory / "logo_source.pdf"
@@ -420,11 +968,20 @@ class PdfMergeApp:
             row=0, column=2, sticky="w", padx=(4, 14), pady=4
         )
         self._add_coordinate_row(source_frame, 1, "切り取り座標", self.source_coord_vars)
+        source_button_frame = ttk.Frame(source_frame)
+        source_button_frame.grid(
+            row=2, column=0, columnspan=6, sticky="w", pady=(8, 2)
+        )
         ttk.Button(
-            source_frame,
+            source_button_frame,
+            text="PDF上で切り取り範囲を指定",
+            command=self._select_source_region_on_pdf,
+        ).pack(side="left")
+        ttk.Button(
+            source_button_frame,
             text="切り取りプレビュー",
             command=self._show_clip_preview,
-        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 2))
+        ).pack(side="left", padx=(8, 0))
 
         destination_frame = ttk.LabelFrame(
             outer, text="3. 貼り付け設定（合成先）", padding=10
@@ -442,12 +999,17 @@ class PdfMergeApp:
         ttk.Label(destination_frame, text="例: すべて / 1 / 1,3-5").grid(
             row=1, column=3, columnspan=3, sticky="w", padx=(8, 0), pady=4
         )
+        ttk.Button(
+            destination_frame,
+            text="PDF上で貼り付け範囲を指定",
+            command=self._select_destination_region_on_pdf,
+        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 2))
 
         ttk.Label(
             outer,
             text=(
                 "座標単位は point、原点はページ左上です。"
-                "1 mm ≒ 2.83465 point。プレビューで切り取り内容を確認してください。"
+                "1 mm ≒ 2.83465 point。マウス指定後も数値欄で微調整できます。"
             ),
             foreground="#555555",
             wraplength=760,
@@ -563,6 +1125,96 @@ class PdfMergeApp:
         if selected:
             self.output_path_var.set(selected)
             self.status_var.set("出力先を指定しました。")
+
+    @staticmethod
+    def _set_coordinate_variables(
+        variables: list[tk.StringVar],
+        coordinates: tuple[float, float, float, float],
+    ) -> None:
+        """マウス選択結果を読みやすい小数表記で座標欄へ設定する。"""
+        for variable, value in zip(variables, coordinates, strict=True):
+            variable.set(f"{value:.2f}".rstrip("0").rstrip("."))
+
+    def _select_source_region_on_pdf(self) -> None:
+        """抽出元PDFを表示し、切り取り範囲とページをマウスで選択する。"""
+        try:
+            source_text = self.source_path_var.get().strip()
+            if not source_text:
+                raise PdfMergeError("抽出元PDFを選択してください。")
+            page_number = self._parse_positive_integer(
+                self.source_page_var.get(), "抽出元ページ"
+            )
+            initial_coordinates = self._parse_coordinates(
+                self.source_coord_vars, "切り取り座標"
+            )
+            selector = PdfRegionSelector(
+                parent=self.root,
+                pdf_path=Path(source_text),
+                initial_page_number=page_number,
+                initial_coordinates=initial_coordinates,
+                title="切り取り範囲を指定",
+                instruction=(
+                    "抽出したいロゴ等を、左上から右下へマウスでドラッグしてください。"
+                    "赤い枠を確認して『この範囲を使用』を押します。"
+                ),
+                outline_color="#e53935",
+            )
+            result = selector.show()
+            if result is None:
+                self.status_var.set("切り取り範囲の指定をキャンセルしました。")
+                return
+            coordinates, selected_page_number = result
+            self._set_coordinate_variables(self.source_coord_vars, coordinates)
+            self.source_page_var.set(str(selected_page_number))
+            self.status_var.set(
+                f"抽出元{selected_page_number}ページ目の切り取り範囲を設定しました。"
+            )
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _select_destination_region_on_pdf(self) -> None:
+        """合成先PDFを表示し、貼り付け範囲をマウスで選択する。"""
+        try:
+            target_text = self.target_path_var.get().strip()
+            if not target_text:
+                raise PdfMergeError("合成先PDFを選択してください。")
+            target_path = Path(target_text)
+            validate_input_file(target_path, "合成先PDF")
+            with fitz.open(str(target_path)) as target_document:
+                validate_pdf_document(target_document, "合成先PDF")
+                page_indices = parse_target_pages(
+                    self.target_pages_var.get().strip(),
+                    target_document.page_count,
+                )
+                initial_page_number = page_indices[0] + 1
+            initial_coordinates = self._parse_coordinates(
+                self.destination_coord_vars, "貼り付け座標"
+            )
+            selector = PdfRegionSelector(
+                parent=self.root,
+                pdf_path=target_path,
+                initial_page_number=initial_page_number,
+                initial_coordinates=initial_coordinates,
+                title="貼り付け範囲を指定",
+                instruction=(
+                    "ロゴ等を配置したい範囲を、左上から右下へマウスで"
+                    "ドラッグしてください。青い枠の座標が対象ページへ適用されます。"
+                ),
+                outline_color="#1976d2",
+            )
+            result = selector.show()
+            if result is None:
+                self.status_var.set("貼り付け範囲の指定をキャンセルしました。")
+                return
+            coordinates, preview_page_number = result
+            self._set_coordinate_variables(
+                self.destination_coord_vars, coordinates
+            )
+            self.status_var.set(
+                f"合成先{preview_page_number}ページ目を基準に貼り付け範囲を設定しました。"
+            )
+        except Exception as exc:
+            self._show_error(exc)
 
     @staticmethod
     def _parse_positive_integer(value: str, label: str) -> int:
