@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PDF領域合成ツール（GUI版）
+請求書・封筒宛名PDF作成ツール（GUI版）
 
-抽出元PDFの指定領域を、合成先PDFの指定位置へベクターデータのまま配置する。
+複数ページの請求書PDFから各ページの宛名領域を抽出し、
+「封筒宛名ページ → 元の請求書ページ」の順番で1つのPDFへまとめる。
 Windows用EXE（PyInstaller --onefile --windowed）での利用を想定している。
 
 主な機能:
-    - 抽出元PDF、合成先PDF、出力先をファイル選択ダイアログで指定
-    - 抽出元ページと切り取り座標を画面で入力
-    - 貼り付け座標を画面で入力
-    - 全ページまたは「1,3-5」のような指定ページへ合成
-    - 切り取り範囲のプレビュー
-    - PDF全体を表示し、マウスドラッグで切り取り範囲と配置範囲を指定
+    - 請求書PDF、封筒テンプレートPDF、出力先を選択
+    - 見本の請求書ページを表示し、宛名範囲をマウスドラッグで指定
+    - 封筒テンプレートを表示し、宛名の印刷位置をマウスドラッグで指定
+    - 全ページまたは「1,3-5」のように処理する請求書ページを指定
+    - 請求書の各ページから同じ座標の宛名を抽出
+    - ユーザーごとに封筒宛名ページと請求書ページを交互に出力
+    - 宛名範囲のプレビュー
     - 入力・座標・ページ範囲・暗号化PDF・保存先を事前検証
     - 一時保存後に出力を置き換え、保存失敗による既存PDF破損を防止
 
@@ -28,7 +30,7 @@ Windows用EXE（PyInstaller --onefile --windowed）での利用を想定して�
     1 point = 1/72 inch、1 mm ≒ 2.83465 point。
 
 重要:
-    show_pdf_page() を使用するため、抽出元がベクターデータなら、
+    show_pdf_page() と insert_pdf() を使用するため、元データがベクターなら、
     ラスタライズせずベクターのまま出力PDFへ配置される。
     プレビュー表示だけは画面確認用に一時的にラスタライズする。
 """
@@ -59,20 +61,22 @@ else:
     FITZ_IMPORT_ERROR = None
 
 
-APP_TITLE: Final[str] = "PDF領域合成ツール"
+APP_TITLE: Final[str] = "請求書・封筒宛名PDF作成ツール"
 PDF_FILE_TYPES: Final[tuple[tuple[str, str], ...]] = (
     ("PDFファイル", "*.pdf"),
     ("すべてのファイル", "*.*"),
 )
 
 # 前回の固定設定をGUIの初期値として維持する。
-DEFAULT_SOURCE_COORDS: Final[tuple[float, float, float, float]] = (
+DEFAULT_ADDRESS_COORDS: Final[tuple[float, float, float, float]] = (
     10.0,
     10.0,
     150.0,
     50.0,
 )
-DEFAULT_DESTINATION_COORDS: Final[tuple[float, float, float, float]] = (
+DEFAULT_ENVELOPE_DESTINATION_COORDS: Final[
+    tuple[float, float, float, float]
+] = (
     400.0,
     20.0,
     540.0,
@@ -104,11 +108,12 @@ def get_application_directory() -> Path:
 
 
 def ensure_distinct_paths(*paths: Path) -> None:
-    """抽出元・合成先・出力先が同じファイルでないことを確認する。"""
+    """請求書・封筒テンプレート・出力先が同じでないことを確認する。"""
     normalized = [os.path.normcase(str(path.resolve(strict=False))) for path in paths]
     if len(normalized) != len(set(normalized)):
         raise PdfMergeError(
-            "抽出元PDF、合成先PDF、出力PDFには異なるファイルを指定してください。"
+            "請求書PDF、封筒テンプレートPDF、出力PDFには"
+            "異なるファイルを指定してください。"
         )
 
     # 表記上のパスが違っても、ハードリンク等で実体が同じ場合を検出する。
@@ -118,7 +123,7 @@ def ensure_distinct_paths(*paths: Path) -> None:
             try:
                 if os.path.samefile(left_path, right_path):
                     raise PdfMergeError(
-                        "抽出元PDF、合成先PDF、出力PDFには"
+                        "請求書PDF、封筒テンプレートPDF、出力PDFには"
                         "実体の異なるファイルを指定してください。"
                     )
             except OSError:
@@ -231,10 +236,10 @@ def validate_rectangle(
         )
 
 
-def parse_target_pages(page_specification: str, page_count: int) -> list[int]:
-    """「すべて」「1,3-5」をPyMuPDF用の0始まりページ番号へ変換する。"""
+def parse_invoice_pages(page_specification: str, page_count: int) -> list[int]:
+    """請求書の「すべて」「1,3-5」を0始まりページ番号へ変換する。"""
     if len(page_specification) > MAX_PAGE_SPECIFICATION_LENGTH:
-        raise PdfMergeError("対象ページの指定が長すぎます。")
+        raise PdfMergeError("請求書ページの指定が長すぎます。")
 
     normalized = (
         page_specification.strip()
@@ -264,49 +269,52 @@ def parse_target_pages(page_specification: str, page_count: int) -> list[int]:
                 selected_pages.add(int(token))
     except ValueError as exc:
         raise PdfMergeError(
-            "対象ページは『すべて』または『1,3-5』の形式で入力してください。"
+            "請求書ページは『すべて』または『1,3-5』の形式で入力してください。"
         ) from exc
 
     invalid = sorted(page for page in selected_pages if not 1 <= page <= page_count)
     if invalid:
         raise PdfMergeError(
-            f"合成先PDFは{page_count}ページです。範囲外の指定: {invalid}"
+            f"請求書PDFは{page_count}ページです。範囲外の指定: {invalid}"
         )
     if not selected_pages:
-        raise PdfMergeError("合成するページが指定されていません。")
+        raise PdfMergeError("処理する請求書ページが指定されていません。")
     return [page - 1 for page in sorted(selected_pages)]
 
 
-def merge_pdf_area(
-    source_path: Path,
-    target_path: Path,
+def create_envelope_invoice_pdf(
+    invoice_path: Path,
+    envelope_template_path: Path,
     output_path: Path,
-    source_page_number: int,
-    source_clip_coords: tuple[float, float, float, float],
-    destination_coords: tuple[float, float, float, float],
-    target_page_specification: str = "すべて",
+    address_clip_coords: tuple[float, float, float, float],
+    envelope_destination_coords: tuple[float, float, float, float],
+    invoice_page_specification: str = "すべて",
     progress_callback: ProgressCallback | None = None,
-) -> int:
-    """指定されたPDF・座標・ページに対してベクター合成を実行する。"""
+) -> tuple[int, int]:
+    """封筒宛名ページと請求書ページを交互に並べたPDFを作成する。
+
+    請求書PDFは「1ページ＝1ユーザー」を前提とする。宛名は全請求書ページの
+    同じ座標から抽出し、封筒テンプレートPDFの1ページ目へ配置する。
+
+    戻り値は ``(処理したユーザー数, 出力ページ数)``。
+    """
     if fitz is None:
         raise PdfMergeError(
             "PyMuPDFがインストールされていません。\n"
             "python -m pip install PyMuPDF を実行してください。"
         ) from FITZ_IMPORT_ERROR
-    if source_page_number < 1:
-        raise PdfMergeError("抽出元ページには1以上の整数を入力してください。")
 
-    ensure_distinct_paths(source_path, target_path, output_path)
-    validate_input_file(source_path, "抽出元PDF")
-    validate_input_file(target_path, "合成先PDF")
+    ensure_distinct_paths(invoice_path, envelope_template_path, output_path)
+    validate_input_file(invoice_path, "請求書PDF")
+    validate_input_file(envelope_template_path, "封筒テンプレートPDF")
     validate_output_path(output_path)
 
-    source_clip = fitz.Rect(source_clip_coords)
-    destination_rect = fitz.Rect(destination_coords)
+    address_clip = fitz.Rect(address_clip_coords)
+    envelope_destination = fitz.Rect(envelope_destination_coords)
     temporary_output = output_path.with_name(
         f".{output_path.stem}_{uuid.uuid4().hex}.tmp.pdf"
     )
-    expected_target_page_count: int | None = None
+    expected_output_page_count: int | None = None
 
     def notify(message: str) -> None:
         # PyInstallerの--windowedでは標準出力がNoneになるため、存在時だけ表示する。
@@ -316,65 +324,114 @@ def merge_pdf_area(
             progress_callback(message)
 
     try:
-        with fitz.open(str(source_path)) as source_document, fitz.open(
-            str(target_path)
-        ) as target_document:
-            validate_pdf_document(source_document, "抽出元PDF")
-            validate_pdf_document(target_document, "合成先PDF")
-            expected_target_page_count = target_document.page_count
+        with (
+            fitz.open(str(invoice_path)) as invoice_document,
+            fitz.open(str(envelope_template_path)) as envelope_document,
+            fitz.open() as output_document,
+        ):
+            validate_pdf_document(invoice_document, "請求書PDF")
+            validate_pdf_document(envelope_document, "封筒テンプレートPDF")
 
-            if source_page_number > source_document.page_count:
+            invoice_page_indices = parse_invoice_pages(
+                invoice_page_specification,
+                invoice_document.page_count,
+            )
+            expected_output_page_count = len(invoice_page_indices) * 2
+            if expected_output_page_count > MAX_PDF_PAGES:
                 raise PdfMergeError(
-                    f"抽出元PDFは{source_document.page_count}ページです。\n"
-                    f"指定ページ: {source_page_number}"
+                    "出力PDFのページ数が安全上の上限"
+                    f"（{MAX_PDF_PAGES:,}ページ）を超えます。\n"
+                    f"処理ユーザー数: {len(invoice_page_indices):,}\n"
+                    f"出力予定ページ数: {expected_output_page_count:,}"
                 )
 
-            source_page_index = source_page_number - 1
-            source_page = source_document.load_page(source_page_index)
+            envelope_template_page = envelope_document.load_page(0)
             validate_rectangle(
-                source_clip,
-                get_unrotated_page_rect(source_page),
-                "切り取り範囲",
-                source_page_number,
-            )
-            page_indices = parse_target_pages(
-                target_page_specification,
-                target_document.page_count,
+                envelope_destination,
+                get_unrotated_page_rect(envelope_template_page),
+                "封筒上の宛名配置範囲",
+                1,
             )
 
-            # 途中まで処理してから座標エラーにならないよう、全ページを先に検証する。
-            for page_index in page_indices:
-                target_page = target_document.load_page(page_index)
+            # 途中まで出力してから座標エラーにならないよう、全請求書ページを先に検証する。
+            rotated_pages: list[tuple[int, int]] = []
+            for invoice_page_index in invoice_page_indices:
+                invoice_page = invoice_document.load_page(invoice_page_index)
                 validate_rectangle(
-                    destination_rect,
-                    get_unrotated_page_rect(target_page),
-                    "貼り付け範囲",
-                    page_index + 1,
+                    address_clip,
+                    get_unrotated_page_rect(invoice_page),
+                    "宛名の切り取り範囲",
+                    invoice_page_index + 1,
                 )
+                if invoice_page.rotation:
+                    rotated_pages.append(
+                        (invoice_page_index + 1, invoice_page.rotation)
+                    )
 
-            if source_page.rotation:
+            if envelope_document.page_count > 1:
                 notify(
-                    f"注意: 抽出元{source_page_number}ページ目には"
-                    f"{source_page.rotation}度の回転情報があります。"
+                    "注意: 封筒テンプレートPDFは複数ページですが、"
+                    "1ページ目だけを使用します。"
+                )
+            if rotated_pages:
+                rotation_summary = ", ".join(
+                    f"{page_number}ページ={rotation}°"
+                    for page_number, rotation in rotated_pages[:10]
+                )
+                if len(rotated_pages) > 10:
+                    rotation_summary += f" ほか{len(rotated_pages) - 10}ページ"
+                notify(f"注意: 回転情報のある請求書ページ: {rotation_summary}")
+
+            total_users = len(invoice_page_indices)
+            for sequence, invoice_page_index in enumerate(
+                invoice_page_indices,
+                start=1,
+            ):
+                is_last_user = sequence == total_users
+
+                # 封筒テンプレートの1ページ目を追加する。
+                # final=0 は、同じ元PDFを繰り返し挿入するときの重複を抑える。
+                output_document.insert_pdf(
+                    envelope_document,
+                    from_page=0,
+                    to_page=0,
+                    final=1 if is_last_user else 0,
+                )
+                envelope_output_page = output_document.load_page(
+                    output_document.page_count - 1
                 )
 
-            for sequence, page_index in enumerate(page_indices, start=1):
-                target_page = target_document.load_page(page_index)
-                target_page.show_pdf_page(
-                    destination_rect,
-                    source_document,
-                    pno=source_page_index,
-                    clip=source_clip,
+                # このユーザーの請求書ページから宛名を抽出して封筒へ配置する。
+                envelope_output_page.show_pdf_page(
+                    envelope_destination,
+                    invoice_document,
+                    pno=invoice_page_index,
+                    clip=address_clip,
                     keep_proportion=False,
                     overlay=True,
                     rotate=0,
                 )
+
+                # 元の請求書ページを、その封筒ページの直後へ追加する。
+                output_document.insert_pdf(
+                    invoice_document,
+                    from_page=invoice_page_index,
+                    to_page=invoice_page_index,
+                    final=1 if is_last_user else 0,
+                )
                 notify(
-                    f"処理中: {sequence}/{len(page_indices)} "
-                    f"（合成先{page_index + 1}ページ目）"
+                    f"処理中: {sequence}/{total_users} "
+                    f"（請求書{invoice_page_index + 1}ページ目）"
                 )
 
-            target_document.save(
+            if output_document.page_count != expected_output_page_count:
+                raise PdfMergeError(
+                    "出力直前のページ数が想定と一致しません。\n"
+                    f"想定: {expected_output_page_count:,}ページ\n"
+                    f"実際: {output_document.page_count:,}ページ"
+                )
+
+            output_document.save(
                 str(temporary_output),
                 garbage=4,
                 deflate=True,
@@ -387,10 +444,14 @@ def merge_pdf_area(
         # 保存直後に再オープンし、破損やページ欠落がないことを確認してから置換する。
         with fitz.open(str(temporary_output)) as verification_document:
             validate_pdf_document(verification_document, "出力PDF")
-            if verification_document.page_count != expected_target_page_count:
-                raise PdfMergeError("出力PDFのページ数が合成先PDFと一致しません。")
+            if verification_document.page_count != expected_output_page_count:
+                raise PdfMergeError(
+                    "出力PDFのページ数が想定と一致しません。\n"
+                    f"想定: {expected_output_page_count:,}ページ\n"
+                    f"実際: {verification_document.page_count:,}ページ"
+                )
         os.replace(temporary_output, output_path)
-        return len(page_indices)
+        return len(invoice_page_indices), expected_output_page_count
     finally:
         try:
             if temporary_output.exists():
@@ -400,31 +461,31 @@ def merge_pdf_area(
 
 
 def create_clip_preview_png(
-    source_path: Path,
-    source_page_number: int,
-    source_clip_coords: tuple[float, float, float, float],
+    invoice_path: Path,
+    sample_page_number: int,
+    address_clip_coords: tuple[float, float, float, float],
 ) -> tuple[bytes, str]:
-    """切り取り範囲をPNG化し、GUIプレビュー用のバイト列と説明を返す。"""
+    """見本ページの宛名範囲をPNG化し、説明とともに返す。"""
     if fitz is None:
         raise PdfMergeError("PyMuPDFがインストールされていません。")
-    validate_input_file(source_path, "抽出元PDF")
-    if source_page_number < 1:
-        raise PdfMergeError("抽出元ページには1以上の整数を入力してください。")
+    validate_input_file(invoice_path, "請求書PDF")
+    if sample_page_number < 1:
+        raise PdfMergeError("見本ページには1以上の整数を入力してください。")
 
-    with fitz.open(str(source_path)) as document:
-        validate_pdf_document(document, "抽出元PDF")
-        if source_page_number > document.page_count:
+    with fitz.open(str(invoice_path)) as document:
+        validate_pdf_document(document, "請求書PDF")
+        if sample_page_number > document.page_count:
             raise PdfMergeError(
-                f"抽出元PDFは{document.page_count}ページです。\n"
-                f"指定ページ: {source_page_number}"
+                f"請求書PDFは{document.page_count}ページです。\n"
+                f"指定ページ: {sample_page_number}"
             )
-        page = document.load_page(source_page_number - 1)
-        clip = fitz.Rect(source_clip_coords)
+        page = document.load_page(sample_page_number - 1)
+        clip = fitz.Rect(address_clip_coords)
         validate_rectangle(
             clip,
             get_unrotated_page_rect(page),
-            "切り取り範囲",
-            source_page_number,
+            "宛名の切り取り範囲",
+            sample_page_number,
         )
 
         base_scale = 3.0
@@ -449,7 +510,7 @@ def create_clip_preview_png(
             annots=False,
         )
         description = (
-            f"ページ {source_page_number}/{document.page_count}  "
+            f"見本ページ {sample_page_number}/{document.page_count}  "
             f"ページサイズ {page.rect.width:.1f} × {page.rect.height:.1f} pt  "
             f"回転 {page.rotation}°"
         )
@@ -900,7 +961,7 @@ class PdfRegionSelector:
 
 
 class PdfMergeApp:
-    """PDF合成条件の入力、プレビュー、実行を提供するTkinter GUI。"""
+    """請求書と封筒の設定、プレビュー、PDF作成を提供するGUI。"""
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -909,27 +970,29 @@ class PdfMergeApp:
         self.root.minsize(800, 660)
 
         application_directory = get_application_directory()
-        default_source = application_directory / "logo_source.pdf"
-        default_target = application_directory / "target_form.pdf"
-        default_output = application_directory / "output_merged.pdf"
+        default_invoice = application_directory / "invoice.pdf"
+        default_envelope = application_directory / "envelope_template.pdf"
+        default_output = application_directory / "invoice_envelope_output.pdf"
 
-        self.source_path_var = tk.StringVar(
-            value=str(default_source) if default_source.exists() else ""
+        self.invoice_path_var = tk.StringVar(
+            value=str(default_invoice) if default_invoice.exists() else ""
         )
-        self.target_path_var = tk.StringVar(
-            value=str(default_target) if default_target.exists() else ""
+        self.envelope_path_var = tk.StringVar(
+            value=str(default_envelope) if default_envelope.exists() else ""
         )
         self.output_path_var = tk.StringVar(value=str(default_output))
-        self.source_page_var = tk.StringVar(value="1")
-        self.target_pages_var = tk.StringVar(value="すべて")
-        self.status_var = tk.StringVar(value="PDFと座標を指定してください。")
+        self.sample_page_var = tk.StringVar(value="1")
+        self.invoice_pages_var = tk.StringVar(value="すべて")
+        self.status_var = tk.StringVar(
+            value="請求書PDF、封筒テンプレート、宛名範囲を指定してください。"
+        )
         self.last_output_path: Path | None = None
-        self.source_coord_vars = [
-            tk.StringVar(value=f"{value:g}") for value in DEFAULT_SOURCE_COORDS
+        self.address_coord_vars = [
+            tk.StringVar(value=f"{value:g}") for value in DEFAULT_ADDRESS_COORDS
         ]
-        self.destination_coord_vars = [
+        self.envelope_coord_vars = [
             tk.StringVar(value=f"{value:g}")
-            for value in DEFAULT_DESTINATION_COORDS
+            for value in DEFAULT_ENVELOPE_DESTINATION_COORDS
         ]
         self._build_ui()
 
@@ -946,63 +1009,92 @@ class PdfMergeApp:
         ).grid(row=0, column=0, sticky="w", pady=(0, 4))
         ttk.Label(
             outer,
-            text="抽出元PDFの指定領域を、合成先PDFへベクターのまま配置します。",
+            text=(
+                "請求書の各ページから宛名を抽出し、"
+                "封筒宛名ページと請求書ページを交互に作成します。"
+                "前提: 請求書PDFの1ページが1ユーザー分です。"
+            ),
+            wraplength=820,
         ).grid(row=1, column=0, sticky="w", pady=(0, 12))
 
         files_frame = ttk.LabelFrame(outer, text="1. ファイル", padding=10)
         files_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         files_frame.columnconfigure(1, weight=1)
-        self._add_file_row(files_frame, 0, "抽出元PDF", self.source_path_var, self._select_source_pdf)
-        self._add_file_row(files_frame, 1, "合成先PDF", self.target_path_var, self._select_target_pdf)
+        self._add_file_row(
+            files_frame,
+            0,
+            "請求書PDF",
+            self.invoice_path_var,
+            self._select_invoice_pdf,
+        )
+        self._add_file_row(
+            files_frame,
+            1,
+            "封筒テンプレート",
+            self.envelope_path_var,
+            self._select_envelope_template_pdf,
+        )
         self._add_file_row(files_frame, 2, "出力PDF", self.output_path_var, self._select_output_pdf)
 
-        source_frame = ttk.LabelFrame(outer, text="2. 切り取り設定（抽出元）", padding=10)
+        source_frame = ttk.LabelFrame(
+            outer,
+            text="2. 宛名の切り取り設定（請求書）",
+            padding=10,
+        )
         source_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(source_frame, text="抽出元ページ").grid(
+        ttk.Label(source_frame, text="見本ページ").grid(
             row=0, column=0, sticky="w", padx=(0, 6), pady=4
         )
-        ttk.Entry(source_frame, textvariable=self.source_page_var, width=8).grid(
+        ttk.Entry(source_frame, textvariable=self.sample_page_var, width=8).grid(
             row=0, column=1, sticky="w", pady=4
         )
-        ttk.Label(source_frame, text="（1始まり）").grid(
+        ttk.Label(source_frame, text="（宛名範囲を決めるためのページ）").grid(
             row=0, column=2, sticky="w", padx=(4, 14), pady=4
         )
-        self._add_coordinate_row(source_frame, 1, "切り取り座標", self.source_coord_vars)
+        self._add_coordinate_row(
+            source_frame,
+            1,
+            "宛名座標",
+            self.address_coord_vars,
+        )
         source_button_frame = ttk.Frame(source_frame)
         source_button_frame.grid(
             row=2, column=0, columnspan=6, sticky="w", pady=(8, 2)
         )
         ttk.Button(
             source_button_frame,
-            text="PDF上で切り取り範囲を指定",
-            command=self._select_source_region_on_pdf,
+            text="請求書上で宛名範囲を指定",
+            command=self._select_address_region_on_pdf,
         ).pack(side="left")
         ttk.Button(
             source_button_frame,
-            text="切り取りプレビュー",
-            command=self._show_clip_preview,
+            text="宛名プレビュー",
+            command=self._show_address_preview,
         ).pack(side="left", padx=(8, 0))
 
         destination_frame = ttk.LabelFrame(
-            outer, text="3. 貼り付け設定（合成先）", padding=10
+            outer, text="3. 宛名の配置設定（封筒）", padding=10
         )
         destination_frame.grid(row=4, column=0, sticky="ew", pady=(0, 10))
         self._add_coordinate_row(
-            destination_frame, 0, "貼り付け座標", self.destination_coord_vars
+            destination_frame,
+            0,
+            "封筒上の座標",
+            self.envelope_coord_vars,
         )
-        ttk.Label(destination_frame, text="対象ページ").grid(
+        ttk.Label(destination_frame, text="処理する請求書ページ").grid(
             row=1, column=0, sticky="w", padx=(0, 6), pady=4
         )
         ttk.Entry(
-            destination_frame, textvariable=self.target_pages_var, width=20
+            destination_frame, textvariable=self.invoice_pages_var, width=20
         ).grid(row=1, column=1, columnspan=2, sticky="w", pady=4)
         ttk.Label(destination_frame, text="例: すべて / 1 / 1,3-5").grid(
             row=1, column=3, columnspan=3, sticky="w", padx=(8, 0), pady=4
         )
         ttk.Button(
             destination_frame,
-            text="PDF上で貼り付け範囲を指定",
-            command=self._select_destination_region_on_pdf,
+            text="封筒上で宛名の配置範囲を指定",
+            command=self._select_envelope_region_on_pdf,
         ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 2))
 
         ttk.Label(
@@ -1018,7 +1110,7 @@ class PdfMergeApp:
         action_frame = ttk.Frame(outer)
         action_frame.grid(row=6, column=0, sticky="ew", pady=(2, 10))
         self.run_button = ttk.Button(
-            action_frame, text="PDFを合成する", command=self._start_merge
+            action_frame, text="宛名・請求書PDFを作成", command=self._start_merge
         )
         self.run_button.pack(side="left")
         self.open_button = ttk.Button(
@@ -1083,32 +1175,36 @@ class PdfMergeApp:
             return str(path.parent)
         return str(get_application_directory())
 
-    def _select_source_pdf(self) -> None:
+    def _select_invoice_pdf(self) -> None:
         selected = filedialog.askopenfilename(
-            title="抽出元PDFを選択",
-            initialdir=self._dialog_initial_directory(self.source_path_var.get()),
+            title="請求書PDFを選択",
+            initialdir=self._dialog_initial_directory(self.invoice_path_var.get()),
             filetypes=PDF_FILE_TYPES,
         )
         if selected:
-            self.source_path_var.set(selected)
-            self.status_var.set("抽出元PDFを選択しました。プレビューを確認してください。")
-
-    def _select_target_pdf(self) -> None:
-        selected = filedialog.askopenfilename(
-            title="合成先PDFを選択",
-            initialdir=self._dialog_initial_directory(self.target_path_var.get()),
-            filetypes=PDF_FILE_TYPES,
-        )
-        if selected:
-            self.target_path_var.set(selected)
+            self.invoice_path_var.set(selected)
+            invoice_path = Path(selected)
             current_output = self.output_path_var.get().strip()
-            default_name = get_application_directory() / "output_merged.pdf"
+            default_name = get_application_directory() / "invoice_envelope_output.pdf"
             if not current_output or Path(current_output) == default_name:
-                target_path = Path(selected)
                 self.output_path_var.set(
-                    str(target_path.with_name(f"{target_path.stem}_merged.pdf"))
+                    str(invoice_path.with_name(f"{invoice_path.stem}_envelopes.pdf"))
                 )
-            self.status_var.set("合成先PDFを選択しました。")
+            self.status_var.set(
+                "請求書PDFを選択しました。見本ページで宛名範囲を指定してください。"
+            )
+
+    def _select_envelope_template_pdf(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="封筒テンプレートPDFを選択",
+            initialdir=self._dialog_initial_directory(self.envelope_path_var.get()),
+            filetypes=PDF_FILE_TYPES,
+        )
+        if selected:
+            self.envelope_path_var.set(selected)
+            self.status_var.set(
+                "封筒テンプレートPDFを選択しました。宛名の配置範囲を指定してください。"
+            )
 
     def _select_output_pdf(self) -> None:
         selected = filedialog.asksaveasfilename(
@@ -1117,7 +1213,7 @@ class PdfMergeApp:
             initialfile=(
                 Path(self.output_path_var.get()).name
                 if self.output_path_var.get().strip()
-                else "output_merged.pdf"
+                else "invoice_envelope_output.pdf"
             ),
             defaultextension=".pdf",
             filetypes=PDF_FILE_TYPES,
@@ -1135,84 +1231,82 @@ class PdfMergeApp:
         for variable, value in zip(variables, coordinates, strict=True):
             variable.set(f"{value:.2f}".rstrip("0").rstrip("."))
 
-    def _select_source_region_on_pdf(self) -> None:
-        """抽出元PDFを表示し、切り取り範囲とページをマウスで選択する。"""
+    def _select_address_region_on_pdf(self) -> None:
+        """請求書を表示し、宛名範囲と見本ページをマウスで選択する。"""
         try:
-            source_text = self.source_path_var.get().strip()
-            if not source_text:
-                raise PdfMergeError("抽出元PDFを選択してください。")
+            invoice_text = self.invoice_path_var.get().strip()
+            if not invoice_text:
+                raise PdfMergeError("請求書PDFを選択してください。")
             page_number = self._parse_positive_integer(
-                self.source_page_var.get(), "抽出元ページ"
+                self.sample_page_var.get(), "見本ページ"
             )
             initial_coordinates = self._parse_coordinates(
-                self.source_coord_vars, "切り取り座標"
+                self.address_coord_vars, "宛名座標"
             )
             selector = PdfRegionSelector(
                 parent=self.root,
-                pdf_path=Path(source_text),
+                pdf_path=Path(invoice_text),
                 initial_page_number=page_number,
                 initial_coordinates=initial_coordinates,
-                title="切り取り範囲を指定",
+                title="請求書上の宛名範囲を指定",
                 instruction=(
-                    "抽出したいロゴ等を、左上から右下へマウスでドラッグしてください。"
-                    "赤い枠を確認して『この範囲を使用』を押します。"
+                    "請求書の宛名部分を、左上から右下へドラッグしてください。"
+                    "ここで決めた座標を、処理対象の全請求書ページに適用します。"
                 ),
                 outline_color="#e53935",
             )
             result = selector.show()
             if result is None:
-                self.status_var.set("切り取り範囲の指定をキャンセルしました。")
+                self.status_var.set("宛名範囲の指定をキャンセルしました。")
                 return
             coordinates, selected_page_number = result
-            self._set_coordinate_variables(self.source_coord_vars, coordinates)
-            self.source_page_var.set(str(selected_page_number))
+            self._set_coordinate_variables(self.address_coord_vars, coordinates)
+            self.sample_page_var.set(str(selected_page_number))
             self.status_var.set(
-                f"抽出元{selected_page_number}ページ目の切り取り範囲を設定しました。"
+                f"請求書{selected_page_number}ページ目を見本に宛名範囲を設定しました。"
             )
         except Exception as exc:
             self._show_error(exc)
 
-    def _select_destination_region_on_pdf(self) -> None:
-        """合成先PDFを表示し、貼り付け範囲をマウスで選択する。"""
+    def _select_envelope_region_on_pdf(self) -> None:
+        """封筒テンプレートを表示し、宛名の配置範囲を選択する。"""
         try:
-            target_text = self.target_path_var.get().strip()
-            if not target_text:
-                raise PdfMergeError("合成先PDFを選択してください。")
-            target_path = Path(target_text)
-            validate_input_file(target_path, "合成先PDF")
-            with fitz.open(str(target_path)) as target_document:
-                validate_pdf_document(target_document, "合成先PDF")
-                page_indices = parse_target_pages(
-                    self.target_pages_var.get().strip(),
-                    target_document.page_count,
-                )
-                initial_page_number = page_indices[0] + 1
+            envelope_text = self.envelope_path_var.get().strip()
+            if not envelope_text:
+                raise PdfMergeError("封筒テンプレートPDFを選択してください。")
+            envelope_path = Path(envelope_text)
+            validate_input_file(envelope_path, "封筒テンプレートPDF")
+            with fitz.open(str(envelope_path)) as envelope_document:
+                validate_pdf_document(envelope_document, "封筒テンプレートPDF")
             initial_coordinates = self._parse_coordinates(
-                self.destination_coord_vars, "貼り付け座標"
+                self.envelope_coord_vars, "封筒上の宛名配置座標"
             )
             selector = PdfRegionSelector(
                 parent=self.root,
-                pdf_path=target_path,
-                initial_page_number=initial_page_number,
+                pdf_path=envelope_path,
+                initial_page_number=1,
                 initial_coordinates=initial_coordinates,
-                title="貼り付け範囲を指定",
+                title="封筒上の宛名配置範囲を指定",
                 instruction=(
-                    "ロゴ等を配置したい範囲を、左上から右下へマウスで"
-                    "ドラッグしてください。青い枠の座標が対象ページへ適用されます。"
+                    "宛名を印刷したい範囲を、左上から右下へドラッグしてください。"
+                    "封筒テンプレートの1ページ目を使用します。"
                 ),
                 outline_color="#1976d2",
             )
             result = selector.show()
             if result is None:
-                self.status_var.set("貼り付け範囲の指定をキャンセルしました。")
+                self.status_var.set("封筒上の配置範囲の指定をキャンセルしました。")
                 return
             coordinates, preview_page_number = result
+            if preview_page_number != 1:
+                raise PdfMergeError(
+                    "封筒の宛名配置範囲は、テンプレートの1ページ目で"
+                    "指定してください。"
+                )
             self._set_coordinate_variables(
-                self.destination_coord_vars, coordinates
+                self.envelope_coord_vars, coordinates
             )
-            self.status_var.set(
-                f"合成先{preview_page_number}ページ目を基準に貼り付け範囲を設定しました。"
-            )
+            self.status_var.set("封筒テンプレート上の宛名配置範囲を設定しました。")
         except Exception as exc:
             self._show_error(exc)
 
@@ -1244,50 +1338,51 @@ class PdfMergeApp:
         Path,
         Path,
         Path,
-        int,
         tuple[float, float, float, float],
         tuple[float, float, float, float],
         str,
     ]:
-        source_text = self.source_path_var.get().strip()
-        target_text = self.target_path_var.get().strip()
+        invoice_text = self.invoice_path_var.get().strip()
+        envelope_text = self.envelope_path_var.get().strip()
         output_text = self.output_path_var.get().strip()
-        if not source_text:
-            raise PdfMergeError("抽出元PDFを選択してください。")
-        if not target_text:
-            raise PdfMergeError("合成先PDFを選択してください。")
+        if not invoice_text:
+            raise PdfMergeError("請求書PDFを選択してください。")
+        if not envelope_text:
+            raise PdfMergeError("封筒テンプレートPDFを選択してください。")
         if not output_text:
             raise PdfMergeError("出力PDFを指定してください。")
         return (
-            Path(source_text),
-            Path(target_text),
+            Path(invoice_text),
+            Path(envelope_text),
             Path(output_text),
-            self._parse_positive_integer(self.source_page_var.get(), "抽出元ページ"),
-            self._parse_coordinates(self.source_coord_vars, "切り取り座標"),
-            self._parse_coordinates(self.destination_coord_vars, "貼り付け座標"),
-            self.target_pages_var.get().strip(),
+            self._parse_coordinates(self.address_coord_vars, "宛名座標"),
+            self._parse_coordinates(
+                self.envelope_coord_vars,
+                "封筒上の宛名配置座標",
+            ),
+            self.invoice_pages_var.get().strip(),
         )
 
-    def _show_clip_preview(self) -> None:
+    def _show_address_preview(self) -> None:
         try:
-            source_text = self.source_path_var.get().strip()
-            if not source_text:
-                raise PdfMergeError("抽出元PDFを選択してください。")
+            invoice_text = self.invoice_path_var.get().strip()
+            if not invoice_text:
+                raise PdfMergeError("請求書PDFを選択してください。")
             page_number = self._parse_positive_integer(
-                self.source_page_var.get(), "抽出元ページ"
+                self.sample_page_var.get(), "見本ページ"
             )
             coordinates = self._parse_coordinates(
-                self.source_coord_vars, "切り取り座標"
+                self.address_coord_vars, "宛名座標"
             )
             png_bytes, description = create_clip_preview_png(
-                Path(source_text), page_number, coordinates
+                Path(invoice_text), page_number, coordinates
             )
         except Exception as exc:
             self._show_error(exc)
             return
 
         preview_window = tk.Toplevel(self.root)
-        preview_window.title("切り取りプレビュー")
+        preview_window.title("宛名プレビュー")
         preview_window.transient(self.root)
         preview_window.grab_set()
         ttk.Label(preview_window, text=description, padding=(12, 10)).pack(anchor="w")
@@ -1298,7 +1393,10 @@ class PdfMergeApp:
         image_label.pack(fill="both", expand=True)
         ttk.Label(
             preview_window,
-            text="このプレビューに見えている内容がPDFへ合成されます。",
+            text=(
+                "この範囲と同じ座標を、処理対象の全請求書ページから"
+                "宛名として抽出します。"
+            ),
             padding=(12, 0, 12, 8),
         ).pack(anchor="w")
         ttk.Button(
@@ -1322,7 +1420,7 @@ class PdfMergeApp:
 
         self.run_button.configure(state="disabled")
         self.open_button.configure(state="disabled")
-        self.status_var.set("PDF合成処理を開始します...")
+        self.status_var.set("封筒宛名ページと請求書ページの作成を開始します...")
         threading.Thread(
             target=self._merge_worker, args=(inputs,), daemon=True
         ).start()
@@ -1333,39 +1431,54 @@ class PdfMergeApp:
             Path,
             Path,
             Path,
-            int,
             tuple[float, float, float, float],
             tuple[float, float, float, float],
             str,
         ],
     ) -> None:
         try:
-            page_count = merge_pdf_area(
-                source_path=inputs[0],
-                target_path=inputs[1],
+            user_count, output_page_count = create_envelope_invoice_pdf(
+                invoice_path=inputs[0],
+                envelope_template_path=inputs[1],
                 output_path=inputs[2],
-                source_page_number=inputs[3],
-                source_clip_coords=inputs[4],
-                destination_coords=inputs[5],
-                target_page_specification=inputs[6],
+                address_clip_coords=inputs[3],
+                envelope_destination_coords=inputs[4],
+                invoice_page_specification=inputs[5],
                 progress_callback=self._post_status,
             )
         except Exception as exc:
             self.root.after(0, self._merge_failed, exc)
             return
-        self.root.after(0, self._merge_succeeded, inputs[2], page_count)
+        self.root.after(
+            0,
+            self._merge_succeeded,
+            inputs[2],
+            user_count,
+            output_page_count,
+        )
 
     def _post_status(self, message: str) -> None:
         self.root.after(0, self.status_var.set, message)
 
-    def _merge_succeeded(self, output_path: Path, page_count: int) -> None:
+    def _merge_succeeded(
+        self,
+        output_path: Path,
+        user_count: int,
+        output_page_count: int,
+    ) -> None:
         self.last_output_path = output_path
         self.run_button.configure(state="normal")
         self.open_button.configure(state="normal")
-        self.status_var.set(f"完了: {page_count}ページへ合成しました。\n{output_path}")
+        self.status_var.set(
+            f"完了: {user_count}ユーザー、{output_page_count}ページを作成しました。\n"
+            f"{output_path}"
+        )
         messagebox.showinfo(
             APP_TITLE,
-            f"PDF合成が完了しました。\n\n対象ページ数: {page_count}\n{output_path}",
+            "宛名・請求書PDFの作成が完了しました。\n\n"
+            f"処理ユーザー数: {user_count}\n"
+            f"出力ページ数: {output_page_count}\n"
+            f"{output_path}",
             parent=self.root,
         )
 
